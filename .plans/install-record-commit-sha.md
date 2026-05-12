@@ -4,14 +4,14 @@
 
 When `npx openskills install <source>` clones a git-sourced skill, the resulting `.openskills.json` file records *when* the install happened (`installedAt`) but not *which commit* was installed. After this change, the same file also records the commit SHA that `git clone` brought down, plus a browser-clickable URL pointing at that commit on the upstream host.
 
-No user-facing command behavior changes. Skills install the same way, in the same place, with the same output. The only observable difference is two extra lines in `.openskills.json`:
+No user-facing command behavior changes for github installs. Skills install the same way, in the same place, with the same output. The observable difference is two extra lines in `.openskills.json`:
 
 ```json
 {
-  "source": "anthropics/skills/pdf-editor",
+  "source": "anthropics/skills/skills/pdf",
   "sourceType": "git",
   "repoUrl": "https://github.com/anthropics/skills",
-  "subpath": "pdf-editor",
+  "subpath": "skills/pdf",
   "installedAt": "2026-05-11T19:42:08.123Z",
   "commitSha": "f458cee31a7577a47ba0c9a101976fa599385174",
   "commitUrl": "https://github.com/anthropics/skills/commit/f458cee31a7577a47ba0c9a101976fa599385174"
@@ -19,6 +19,8 @@ No user-facing command behavior changes. Skills install the same way, in the sam
 ```
 
 Both fields contain the **full 40-character SHA** that `git rev-parse HEAD` returned — no truncation. `commitUrl` is always an `https://` URL so that terminals (iTerm2, Warp, VS Code's integrated terminal) and editors that auto-linkify URLs make it clickable — `cat .openskills.json` becomes a one-step "what code am I actually running?" lookup.
+
+For installs from **non-github hosts** (e.g. a self-hosted git server reached by full URL), `commitSha` is still recorded but `commitUrl` is omitted from the JSON. A yellow warning is printed at install time so the user knows: `Warning: clone succeeded, but the \`commitUrl\` field was not written to .openskills.json (host not yet supported for clickable URL generation).` The install itself succeeds. Adding support for another host is a small, well-scoped follow-up (see "Building the commit URL" below).
 
 ### Why this is useful on its own
 
@@ -37,13 +39,19 @@ Both fields contain the **full 40-character SHA** that `git rev-parse HEAD` retu
 
 ### Where the SHA comes from
 
-Right after the clone succeeds at [src/commands/install.ts:160](https://github.com/kinueng/openskills/blob/main/src/commands/install.ts#L160), run:
+Right after the clone succeeds at [src/commands/install.ts:162](https://github.com/kinueng/openskills/blob/main/src/commands/install.ts#L162), run:
 
 ```ts
-const commitSha = execSync(`git -C "${tempDir}/repo" rev-parse HEAD`, { stdio: ['pipe','pipe','pipe'] })
-  .toString().trim();
+const commitSha = execSync(`git -C "${tempDir}/repo" rev-parse HEAD`, {
+  encoding: 'utf-8',
+  stdio: 'pipe',
+}).trim();
 sourceInfo.commitSha = commitSha;
 sourceInfo.commitUrl = buildCommitUrl(repoUrl, commitSha);
+if (!sourceInfo.commitUrl) {
+  // Clone worked — only the URL builder couldn't recognize the host.
+  console.log(chalk.yellow('Warning: ...'));
+}
 ```
 
 A note on shallow clones: the existing install code already runs `git clone --depth 1` (see [src/commands/install.ts:157](https://github.com/kinueng/openskills/blob/main/src/commands/install.ts#L157)), which only downloads the latest snapshot, not the project's full history. That's fine for our SHA lookup — `HEAD` is a tiny pointer file inside the clone that records "the current commit is X", written the moment the clone completes. `git rev-parse HEAD` just reads that pointer, so it works the same whether we fetched 1 commit or 100,000. No history walk, no extra network calls.
@@ -56,16 +64,26 @@ The captured SHA is the *whole repo's* HEAD at clone time, not the subpath's. So
 
 `commitSha` is host-agnostic — we read it via `git rev-parse HEAD` from the local clone, which works regardless of where the repo came from. `commitUrl` is host-specific, since different hosts use different URL patterns for viewing commits (`/commit/<sha>`, `/-/commit/<sha>`, `/commits/<sha>`, …).
 
-`buildCommitUrl(repoUrl, sha)` is a small pure helper that returns a browser-clickable `https://` URL when it recognizes the host's pattern, or `undefined` otherwise. In this PR it recognizes github-style hosts (github.com plus any host whose commit path follows the `/<owner>/<repo>/commit/<sha>` convention). For unrecognized hosts, `commitUrl` is omitted from `.openskills.json` and the user still gets `commitSha` to look up manually.
+`buildCommitUrl(repoUrl, sha)` lives in [src/utils/skill-metadata.ts](https://github.com/kinueng/openskills/blob/main/src/utils/skill-metadata.ts) and returns a browser-clickable `https://` URL when it recognizes the host, or `undefined` otherwise. **github.com is the only registered host today.** For other hosts the field is omitted from the JSON and the install warns (see above).
 
-**Normalization rules for github-style inputs.** The output is always `https://<host>/<owner>/<repo>/commit/<sha>` — HTTPS scheme is enforced regardless of how the user originally cloned (SSH, `git://`, or HTTPS), so the URL is always browser-clickable:
+**Extensibility.** Host patterns live in a `COMMIT_URL_BUILDERS` map keyed by `URL.hostname`. To support another host, a future contributor adds one entry — no other code touches:
 
-- `https://github.com/anthropics/skills` → use as-is.
-- `https://github.com/anthropics/skills.git` → strip trailing `.git`.
-- `git@github.com:anthropics/skills.git` → rewrite SSH to HTTPS (`git@<host>:<path>` → `https://<host>/<path>`), strip trailing `.git`.
-- `git://github.com/anthropics/skills.git` → rewrite scheme to `https`, strip trailing `.git`.
+```ts
+const COMMIT_URL_BUILDERS: Record<string, CommitUrlBuilder> = {
+  'github.com': (repoPath, commitSha) => { /* validate + format */ },
+  // '<host>': (repoPath, commitSha) => `https://<host>/${repoPath}/commit/${commitSha}`,
+};
+```
 
-The helper lives in [src/utils/skill-metadata.ts](https://github.com/kinueng/openskills/blob/main/src/utils/skill-metadata.ts) next to the metadata types, so the same logic can be reused by any future code that needs to display a clickable link (e.g. an `openskills info` command).
+Each builder receives the full `repoPath` (everything between the hostname and the optional `.git` suffix) and the SHA, then returns either an `https://` URL or `undefined` if the path shape is wrong for that host. The github builder validates exactly `<owner>/<repo>` (no nested orgs).
+
+**URL parsing.** All clone-URL parsing goes through the standard `new URL()` constructor for security and correctness:
+
+- HTTPS / HTTP / `git://` URLs are passed straight to `URL()`.
+- SSH form (`git@host:owner/repo`) isn't a valid URI, so a small `sshToHttps` helper rewrites it to `https://host/owner/repo` first. SSH prefix detection is case-insensitive (`Git@`, `GIT@` are recognized).
+- A trailing `.git` is stripped from the path. The leading `/` from `URL.pathname` is stripped.
+- The `URL` constructor handles tricky inputs safely: userinfo spoofing (`https://attacker@github.com/...` → `hostname = "github.com"`), path traversal (`/foo/../bar` → `/bar`), IDN homoglyphs, embedded query/fragment.
+- Hosts and schemes are normalized to lowercase by `URL()`. The path is preserved verbatim (case-sensitive on github).
 
 ### Why thread it through `sourceInfo`
 
@@ -90,13 +108,18 @@ Also extend `InstallSourceInfo` in [src/commands/install.ts](https://github.com/
 
 ### Error handling
 
-If `git rev-parse HEAD` fails (it shouldn't — we just successfully cloned the same repo a line earlier), the install fails the same way any other unexpected exception fails: the existing try/catch around the clone block reports it and exits non-zero. We do *not* swallow the error to install without a SHA — better to fail loudly so the bug surfaces, given that this command should be reliable.
+Two distinct failure modes:
+
+1. **`git rev-parse HEAD` throws** (extremely unlikely after a successful `--depth 1` clone). The existing outer `try/catch` around the clone block catches it, prints the existing failure message, and exits non-zero. The install aborts. We do *not* swallow the error to install without a SHA — better to fail loudly.
+
+2. **`buildCommitUrl` returns `undefined`** (host not registered, or malformed `repoUrl`). The install **succeeds** — `commitSha` is still written. The `commitUrl` field is simply omitted from `.openskills.json`, and a yellow warning is printed naming the file and field that wasn't populated. No placeholder string is written into the JSON (we deliberately avoid echoing the raw `repoUrl` into the file to side-step any auto-linkifier abuse risk).
 
 ## Files to modify
 
-- [src/utils/skill-metadata.ts](https://github.com/kinueng/openskills/blob/main/src/utils/skill-metadata.ts) — add `commitSha?: string` to `SkillSourceMetadata`.
-- [src/commands/install.ts](https://github.com/kinueng/openskills/blob/main/src/commands/install.ts) — capture SHA after clone ([~line 160](https://github.com/kinueng/openskills/blob/main/src/commands/install.ts#L160)); add field to `InstallSourceInfo`; include in `buildGitMetadata` ([line 498](https://github.com/kinueng/openskills/blob/main/src/commands/install.ts#L498)).
+- [src/utils/skill-metadata.ts](https://github.com/kinueng/openskills/blob/main/src/utils/skill-metadata.ts) — add `commitSha?: string` and `commitUrl?: string` to `SkillSourceMetadata`. Add `buildCommitUrl`, the `COMMIT_URL_BUILDERS` registry, and the `parseCloneUrl` / `sshToHttps` helpers.
+- [src/commands/install.ts](https://github.com/kinueng/openskills/blob/main/src/commands/install.ts) — add `commitSha` / `commitUrl` to `InstallSourceInfo`; capture SHA after clone; build commit URL; print warning when missing; include both fields in `buildGitMetadata`.
 - `tests/integration/install.test.ts` — new test file (below).
+- [tests/integration/e2e.test.ts](https://github.com/kinueng/openskills/blob/main/tests/integration/e2e.test.ts) — remove the moved `install (local paths)` describe block.
 
 No changes to `update.ts`, `sync.ts`, or `cli.ts`. No new dependencies.
 
@@ -129,11 +152,10 @@ Style matches `e2e.test.ts`: invoke the built CLI via `execSync`, real filesyste
 
 **New for this PR:**
 
-1. **Install from real github records `commitSha` and `commitUrl`.** Run `node dist/cli.js install anthropics/skills/pdf-editor --yes` against real github.com. Assert: `.openskills.json` exists, `commitSha` is a 40-char hex string, `commitUrl` equals `https://github.com/anthropics/skills/commit/<commitSha>`.
-2. **`commitUrl` returns HTTP 200.** Fetch the recorded `commitUrl`; assert response status is 200. Confirms the URL is actually browser-clickable.
-3. **`buildCommitUrl` normalization** (pure-function test cases): HTTPS, HTTPS+`.git`, SSH (`git@github.com:...`), `git://github.com/...` → all produce `https://github.com/<owner>/<repo>/commit/<sha>`. Unknown host (`https://example.com/foo/bar`) → returns `undefined`.
+1. **Install from real github records `commitSha` and `commitUrl`.** Run `node dist/cli.js install anthropics/skills/skills/pdf --yes` against real github.com. Assert: `.openskills.json` exists, `commitSha` is a 40-char hex string (`/^[0-9a-f]{40}$/`), `commitUrl` equals `https://github.com/anthropics/skills/commit/<commitSha>`.
+2. **`buildCommitUrl` normalization** (pure-function unit tests): HTTPS, HTTPS+`.git`, SSH (`git@github.com:...`), `git://github.com/...` → all produce `https://github.com/anthropics/skills/commit/<sha>`. Case-insensitive SSH (`Git@`, `GIT@`) is also covered. A non-github host (`https://gitlab.com/...`) → `buildCommitUrl` returns `undefined`, documenting that gitlab is unsupported today.
 
-The first two new cases require network access at test time. They're appropriate for [tests/integration/](https://github.com/kinueng/openskills/tree/main/tests/integration) (the directory already implies "real CLI, real environment") and run as part of `npm test` — which already executes on every CI run via [.github/workflows/ci.yml](https://github.com/kinueng/openskills/blob/main/.github/workflows/ci.yml). No CI changes needed.
+The github install case requires network access. It's appropriate for [tests/integration/](https://github.com/kinueng/openskills/tree/main/tests/integration) (the directory already implies "real CLI, real environment") and runs as part of `npm test` — which already executes on every CI run via [.github/workflows/ci.yml](https://github.com/kinueng/openskills/blob/main/.github/workflows/ci.yml). No CI changes needed.
 
 ## Verification
 
@@ -146,8 +168,12 @@ npm run build
 Manual smoke:
 
 ```
-node dist/cli.js install anthropics/skills/pdf-editor --yes
-cat .claude/skills/pdf-editor/.openskills.json   # should include "commitSha" and "commitUrl"
+node dist/cli.js install anthropics/skills/skills/pdf --yes
+cat .claude/skills/pdf/.openskills.json   # should include "commitSha" and "commitUrl"
+
+# Optionally verify the warning path against any non-github clone URL:
+node dist/cli.js install <your-non-github-clone-url> --yes
+# expect: "Warning: clone succeeded, but the `commitUrl` field was not written ..."
 ```
 
 ## PR notes
