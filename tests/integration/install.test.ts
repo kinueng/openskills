@@ -121,12 +121,21 @@ describe('openskills install', () => {
       expect(buildCommitUrl('git@github.com:anthropics/skills.git', sha)).toBe(expectedUrl);
     });
 
+    it('recognizes SSH form regardless of git@ prefix casing', () => {
+      // Rare in practice but harmless to support — pasted/munged URLs sometimes
+      // arrive with weird casing.
+      expect(buildCommitUrl('Git@github.com:anthropics/skills.git', sha)).toBe(expectedUrl);
+      expect(buildCommitUrl('GIT@github.com:anthropics/skills.git', sha)).toBe(expectedUrl);
+    });
+
     it('rewrites git:// scheme to https and strips .git', () => {
       expect(buildCommitUrl('git://github.com/anthropics/skills.git', sha)).toBe(expectedUrl);
     });
 
-    it('returns undefined for unrecognized hosts', () => {
-      expect(buildCommitUrl('https://example.com/foo/bar', sha)).toBeUndefined();
+    it('returns undefined for non-github hosts (e.g. gitlab.com is not yet supported)', () => {
+      // Real gitlab skills repo — picked deliberately so this test stays
+      // meaningful if/when someone adds gitlab support and needs to update it.
+      expect(buildCommitUrl('https://gitlab.com/gitlab-org/ai/skills', sha)).toBeUndefined();
     });
   });
 });
