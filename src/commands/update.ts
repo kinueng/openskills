@@ -6,12 +6,22 @@ import chalk from 'chalk';
 import ora from 'ora';
 import { findAllSkills } from '../utils/skills.js';
 import { normalizeSkillNames } from '../utils/skill-names.js';
-import { readSkillMetadata, writeSkillMetadata } from '../utils/skill-metadata.js';
+import { readSkillMetadata, writeSkillMetadata, buildCommitUrl } from '../utils/skill-metadata.js';
 
 /**
  * Update installed skills from their recorded source metadata.
+ *
+ * Git-sourced skills with a recorded `commitSha` are first probed with
+ * `git ls-remote` (a few KB, no objects transferred). If upstream HEAD
+ * matches the recorded SHA, the skill is reported "Up to date" and left
+ * untouched. The full clone runs only when the SHA differs, the peek
+ * fails, the metadata has no SHA (legacy install), or `force` is true.
  */
-export async function updateSkills(skillNames: string[] | string | undefined): Promise<void> {
+export async function updateSkills(
+  skillNames: string[] | string | undefined,
+  options?: { force?: boolean }
+): Promise<void> {
+  const force = options?.force ?? false;
   const requested = normalizeSkillNames(skillNames);
   const skills = findAllSkills();
 
@@ -44,6 +54,7 @@ export async function updateSkills(skillNames: string[] | string | undefined): P
   }
 
   let updated = 0;
+  let upToDate = 0;
   let skipped = 0;
   const missingMetadata: string[] = [];
   const missingLocalSource: string[] = [];
@@ -89,6 +100,20 @@ export async function updateSkills(skillNames: string[] | string | undefined): P
       continue;
     }
 
+    // Skip the full clone when we can prove upstream hasn't moved.
+    // Only meaningful when we have a SHA on file to compare against;
+    // legacy installs without one fall through and get one stamped on
+    // the re-clone below. A failed peek also falls through so the
+    // existing clone-error handling runs.
+    if (!force && metadata.commitSha) {
+      const upstreamSha = peekRemoteHead(metadata.repoUrl);
+      if (upstreamSha && upstreamSha === metadata.commitSha) {
+        console.log(chalk.dim(`Up to date: ${skill.name}`));
+        upToDate++;
+        continue;
+      }
+    }
+
     const tempDir = join(homedir(), `.openskills-temp-${Date.now()}`);
     mkdirSync(tempDir, { recursive: true });
 
@@ -107,8 +132,18 @@ export async function updateSkills(skillNames: string[] | string | undefined): P
         continue;
       }
 
+      const newSha = execSync(`git -C "${repoDir}" rev-parse HEAD`, {
+        encoding: 'utf-8',
+        stdio: 'pipe',
+      }).trim();
+
       updateSkillFromDir(skill.path, sourceDir);
-      writeSkillMetadata(skill.path, { ...metadata, installedAt: new Date().toISOString() });
+      writeSkillMetadata(skill.path, {
+        ...metadata,
+        installedAt: new Date().toISOString(),
+        commitSha: newSha,
+        commitUrl: buildCommitUrl(metadata.repoUrl, newSha),
+      });
       spinner.succeed(`Updated ${skill.name}`);
       updated++;
     } catch (error) {
@@ -125,7 +160,11 @@ export async function updateSkills(skillNames: string[] | string | undefined): P
     }
   }
 
-  console.log(chalk.dim(`Summary: ${updated} updated, ${skipped} skipped (${targets.length} total)`));
+  console.log(
+    chalk.dim(
+      `Summary: ${updated} updated, ${upToDate} up to date, ${skipped} skipped (${targets.length} total)`
+    )
+  );
 
   if (missingMetadata.length > 0) {
     console.log(chalk.yellow(`Missing source metadata (${missingMetadata.length}): ${missingMetadata.join(', ')}`));
@@ -146,6 +185,33 @@ export async function updateSkills(skillNames: string[] | string | undefined): P
   }
   if (cloneFailures.length > 0) {
     console.log(chalk.yellow(`Clone failed (${cloneFailures.length}): ${cloneFailures.join(', ')}`));
+  }
+}
+
+/**
+ * Probe the remote default branch's HEAD via `git ls-remote` — the cheap
+ * stage-1 of the clone protocol (ref discovery only, no packfile transfer).
+ * Same URL, auth, and rate-limit bucket as the eventual clone, so this
+ * adds no new network surface.
+ *
+ * Returns the 40-char hex SHA on success, or null on any failure
+ * (network/auth/url problem, unparseable output). Callers treat null as
+ * "couldn't confirm — fall through to clone".
+ */
+function peekRemoteHead(repoUrl: string): string | null {
+  try {
+    const out = execSync(`git ls-remote "${repoUrl}" HEAD`, {
+      encoding: 'utf-8',
+      stdio: 'pipe',
+    });
+    // Each ls-remote line is `<sha>\t<ref>`. We only asked for HEAD, so
+    // the first line's first token is the SHA we want.
+    const firstLine = out.split('\n')[0]?.trim();
+    if (!firstLine) return null;
+    const sha = firstLine.split(/\s+/)[0];
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
   }
 }
 
