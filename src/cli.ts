@@ -57,7 +57,8 @@ program
 program
   .command('update [skill-names...]')
   .description('Update installed skills from their source (default: all)')
-  .action(updateSkills);
+  .option('-f, --force', 'Re-clone even when upstream commit matches the recorded one')
+  .action((skillNames, opts) => updateSkills(skillNames, { force: Boolean(opts.force) }));
 
 program
   .command('sync')
